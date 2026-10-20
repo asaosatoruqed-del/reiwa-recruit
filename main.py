@@ -1,18 +1,80 @@
+=== FILE: requirements.txt ===
+requests
+beautifulsoup4
+google-genai
+pydantic
+=== END ===
+
+=== FILE: .github/workflows/crawl_jobs.yml ===
+name: Crawl and Parse Jobs
+
+on:
+  schedule:
+    # 毎朝 JST 8:00 (UTC 23:00) に自動巡回
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 google-genai pydantic
+
+      - name: Run crawler
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python main.py
+
+      - name: Commit and push jobs.json
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add jobs.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update jobs.json [skip ci]" && git pull --rebase origin main && git push)
+=== END ===
+
+=== FILE: main.py ===
 import os
 import re
 import json
+import time
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional
 import requests
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# データの保存先（GitHub Actionsでコミットしていくベース）
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 JOBS_FILE = "jobs.json"
 
-# テスト用のグロース上場企業サンプルリスト（実際にはここに企業の採用ページURLを並べる）
-TARGET_COMPANIES = [
+# テスト用ターゲット（国内テック企業・グローバル案件など）
+TARGET_SOURCES = [
     {
-        "name": "サンプルテクノロジー株式会社",
-        "url": "https://example.com/recruit", # テスト用に後で実際のURLや適当なサイトに差し替え可能
+        "company": "SmartHR",
+        "url": "https://open.talentio.com/r/1/c/smarthr/pages/77114",
+        "type": "domestic"
+    },
+    {
+        "company": "LayerX",
+        "url": "https://open.talentio.com/r/1/c/layerx/pages/75432",
+        "type": "domestic"
     }
 ]
 
@@ -24,99 +86,125 @@ HEADERS = {
     )
 }
 
-def clean_html_text(raw_html: str) -> str:
-    """HTMLからタグや不要なスクリプトを削ぎ落としてテキスト化する"""
-    text = re.sub(r'<(script|style|noscript)[^>]*>[\s\S]*?</\1>', '', raw_html, flags=re.IGNORECASE)
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'</p>', '\n', text)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    return re.sub(r'\n\s*\n', '\n', text).strip()
+# 構造化出力用の Pydantic スキーマ定義
+class JobItem(BaseModel):
+    title: str = Field(description="募集職種名（例: シニアバックエンドエンジニア）")
+    remote_type: str = Field(description="リモート区分: 'フルリモート', 'ハイブリッド', '出社前提' のいずれか")
+    salary_range: Optional[str] = Field(description="年収・報酬表記（例: 800万〜1,200万円、または $80,000 - $120,000）")
+    tech_stack: List[str] = Field(description="主要な必須・歓迎技術タグ（例: ['Go', 'AWS', 'Kubernetes']）")
+    summary_points: List[str] = Field(description="求人の要点・業務内容の箇条書き（ファン・求職者向けに2〜3行）")
+    currency: str = Field(description="通貨: 'JPY', 'USD', 'EUR', 'その他'")
 
-def parse_job_with_gemini(company_name: str, raw_text: str, api_key: str) -> dict:
-    """Geminiにテキストを投げ、求人情報をJSON構造化させる"""
-    if not api_key or not raw_text.strip():
+def load_jobs() -> list:
+    if os.path.exists(JOBS_FILE):
+        try:
+            with open(JOBS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+def save_jobs(jobs: list):
+    try:
+        with open(JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERROR] jobs.json 保存失敗: {e}")
+
+def clean_html(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)[:6000]
+
+def parse_with_gemini(company_name: str, raw_text: str) -> Optional[JobItem]:
+    if not GEMINI_API_KEY or not raw_text.strip():
         return None
-
-    client = genai.Client(api_key=api_key)
-    
-    prompt = f"""
-以下の企業（{company_name}）の採用ページテキストから、求人情報を抽出してJSON形式で出力してください。
-
-【抽出項目】
-- company_name: 企業名 (string)
-- is_hiring: 現在中途や新卒などの求人を募集しているか (boolean)
-- positions: 募集職種のリスト (array of strings)
-- key_requirements: 求める人物像や必須スキル (string)
-- direct_appeal: 企業からのメッセージや「直接応募してほしい」熱量のあるアピール文の要約 (string)
-
-※JSONフォーマットのみで出力してください。余計な解説は不要です。
-"""
-
-    # 構造化出力のためのスキーマ定義
-    response_schema = {
-        "type": "OBJECT",
-        "properties": {
-            "company_name": {"type": "STRING"},
-            "is_hiring": {"type": "BOOLEAN"},
-            "positions": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "key_requirements": {"type": "STRING"},
-            "direct_appeal": {"type": "STRING"}
-        },
-        "required": ["company_name", "is_hiring", "positions", "key_requirements", "direct_appeal"]
-    }
 
     try:
-        cfg = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=response_schema,
-            temperature=0.1
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = (
+            f"以下は企業「{company_name}」の公式求人ページから抽出したテキストです。\n"
+            "募集職種、実質的なリモート度、年収レンジ、主要技術スタック、および2〜3行の簡潔な要点を抽出し、指定のスキーマに従ってJSON出力してください。\n\n"
+            f"{raw_text}"
         )
+
         response = client.models.generate_content(
-            model="gemini-2.5-flash", # 高速・安価なFlashモデルを使用
-            contents=[raw_text[:4000], prompt],
-            config=cfg
+            model="gemini-3.8-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=JobItem,
+                temperature=0.2
+            )
         )
-        return json.loads(response.text)
+        return JobItem.model_validate_json(response.text)
     except Exception as e:
-        print(f"Gemini parsing failed for {company_name}: {e}")
+        print(f"[GEMINI] パースエラー ({company_name}): {e}")
         return None
 
-def main():
-    print("=== 令和リクルート パトロール開始 ===")
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is missing.")
-        return
+def run():
+    jst = timezone(timedelta(hours=9))
+    now = datetime.now(jst)
+    today_str = now.strftime("%Y-%m-%d")
 
-    collected_jobs = []
+    print(f"=== 求人クローラー巡回開始 ({today_str}) ===")
+    existing_jobs = load_jobs()
+    existing_urls = {job.get("source_url") for job in existing_jobs}
 
-    for comp in TARGET_COMPANIES:
-        name = comp["name"]
-        url = comp["url"]
-        print(f"巡回中: {name} ({url})")
+    updated_count = 0
 
+    for item in TARGET_SOURCES:
+        url = item["url"]
+        company = item["company"]
+
+        if url in existing_urls:
+            print(f"[SKIP] 取得済み: {company}")
+            continue
+
+        print(f"[FETCH] 取得中: {company} ({url})")
         try:
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            res.raise_for_status()
-            text_body = clean_html_text(res.text)
+            res = requests.get(url, headers=HEADERS, timeout=15)
+            if res.status_code != 200:
+                print(f"[WARN] HTTP {res.status_code}: {url}")
+                continue
 
-            # Geminiで構造化
-            job_data = parse_job_with_gemini(name, text_body, api_key)
-            if job_data and job_data.get("is_hiring"):
-                job_data["url"] = url
-                collected_jobs.append(job_data)
-                print(f" -> 採用情報GET! 職種: {job_data['positions']}")
-            else:
-                print(f" -> 募集なし or パース失敗")
+            cleaned_text = clean_html(res.text)
+            parsed: Optional[JobItem] = parse_with_gemini(company, cleaned_text)
+
+            if parsed:
+                job_record = {
+                    "id": f"{int(time.time())}_{len(existing_jobs) + 1}",
+                    "company": company,
+                    "title": parsed.title,
+                    "remote_type": parsed.remote_type,
+                    "salary_range": parsed.salary_range or "応相談",
+                    "currency": parsed.currency,
+                    "tech_stack": parsed.tech_stack,
+                    "summary_points": parsed.summary_points,
+                    "source_url": url,
+                    "updated_at": today_str,
+                    "is_active": True
+                }
+                existing_jobs.insert(0, job_record)
+                existing_urls.add(url)
+                updated_count += 1
+                print(f"[SUCCESS] {company} - {parsed.title} (リモート: {parsed.remote_type}, 技術: {', '.join(parsed.tech_stack[:3])})")
+
+            time.sleep(2)  # 相手先サーバーに配慮したインターバル
+
         except Exception as e:
-            print(f"Fetch failed for {name}: {e}")
+            print(f"[ERROR] 処理失敗 ({company}): {e}")
 
-    # 結果をJSONに保存（後でStreamlitアプリがこれを読み込む）
-    with open(JOBS_FILE, "w", encoding="utf-8") as f:
-        json.dump(collected_jobs, f, ensure_ascii=False, indent=2)
-    
-    print(f"=== 巡回完了 (有効求人数: {len(collected_jobs)}件) ===")
+    if updated_count > 0:
+        save_jobs(existing_jobs)
+        print(f"=== {updated_count} 件の新規求人を jobs.json に保存しました ===")
+    else:
+        print("=== 新規求人はありませんでした ===")
 
 if __name__ == "__main__":
-    main()
+    run()
+=== END ===
