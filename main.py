@@ -1,54 +1,3 @@
-=== FILE: requirements.txt ===
-requests
-beautifulsoup4
-google-genai
-pydantic
-=== END ===
-
-=== FILE: .github/workflows/crawl_jobs.yml ===
-name: Crawl and Parse Jobs
-
-on:
-  schedule:
-    # 毎朝 JST 8:00 (UTC 23:00) に自動巡回
-    - cron: '0 23 * * *'
-  workflow_dispatch:
-
-jobs:
-  crawl:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-genai pydantic
-
-      - name: Run crawler
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          python main.py
-
-      - name: Commit and push jobs.json
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add jobs.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update jobs.json [skip ci]" && git pull --rebase origin main && git push)
-=== END ===
-
-=== FILE: main.py ===
 import os
 import re
 import json
@@ -64,7 +13,6 @@ from google.genai import types
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 JOBS_FILE = "jobs.json"
 
-# テスト用ターゲット（国内テック企業・グローバル案件など）
 TARGET_SOURCES = [
     {
         "company": "SmartHR",
@@ -86,13 +34,12 @@ HEADERS = {
     )
 }
 
-# 構造化出力用の Pydantic スキーマ定義
 class JobItem(BaseModel):
     title: str = Field(description="募集職種名（例: シニアバックエンドエンジニア）")
     remote_type: str = Field(description="リモート区分: 'フルリモート', 'ハイブリッド', '出社前提' のいずれか")
     salary_range: Optional[str] = Field(description="年収・報酬表記（例: 800万〜1,200万円、または $80,000 - $120,000）")
     tech_stack: List[str] = Field(description="主要な必須・歓迎技術タグ（例: ['Go', 'AWS', 'Kubernetes']）")
-    summary_points: List[str] = Field(description="求人の要点・業務内容の箇条書き（ファン・求職者向けに2〜3行）")
+    summary_points: List[str] = Field(description="求人の要点・業務内容の箇条書き（求職者向けに2〜3行）")
     currency: str = Field(description="通貨: 'JPY', 'USD', 'EUR', 'その他'")
 
 def load_jobs() -> list:
@@ -194,7 +141,7 @@ def run():
                 updated_count += 1
                 print(f"[SUCCESS] {company} - {parsed.title} (リモート: {parsed.remote_type}, 技術: {', '.join(parsed.tech_stack[:3])})")
 
-            time.sleep(2)  # 相手先サーバーに配慮したインターバル
+            time.sleep(2)
 
         except Exception as e:
             print(f"[ERROR] 処理失敗 ({company}): {e}")
@@ -207,4 +154,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-=== END ===
